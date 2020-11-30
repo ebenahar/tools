@@ -1,6 +1,5 @@
 import smtplib
 import datetime
-import urllib.request
 import importlib
 from subprocess import check_output
 
@@ -29,14 +28,6 @@ class VsphereOps:
         vsphere_mod = importlib.import_module(f"ocs_ci.utility.vsphere")
         self.vsphere = vsphere_mod.VSPHERE(host=host, user=username, password=password)
 
-    def download_repo_file(self, url):
-        filename = url.split('/')[-1]
-        f = urllib.request.urlopen(url)
-        data = f.read()
-        f.close()
-        with open(filename, 'w') as myfile:
-            myfile.write(data)
-
     def remove_ocsci_dir(self):
         cmd = 'rm -rf ocs-ci'
         check_output(cmd, shell=True).decode()
@@ -51,11 +42,8 @@ class VsphereOps:
         msg['To'] = to
         msg['Subject'] = subject
 
-        # msg_p1 = MIMEText(text, 'plain', 'UTF-8')
-        msg_p2 = MIMEText(text, 'html', 'UTF-8')
-
-        # msg.attach(msg_p1)
-        msg.attach(msg_p2)
+        msg_p1 = MIMEText(text, 'html', 'UTF-8')
+        msg.attach(msg_p1)
 
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.ehlo()
@@ -78,7 +66,7 @@ class VsphereOps:
             "Comments"
         ]
 
-        min_diff = 0.3
+        min_diff = 0.15
         free_space_per = self.get_datastore_free_capacity_percentage(datastore_name=datastore, datacenter_name=dc)
         if free_space_per < min_diff:
             to_list = list()
