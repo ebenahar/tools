@@ -7,15 +7,18 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from prettytable import PrettyTable
 
-from platform_usage import config
 
-host = config.host
-username = config.username
-password = config.password
-port = config.port
-cluster = config.cluster
-dc = config.dc
-datastore = config.datastore
+email_credentials = {'username': 'FILL_IN', 'password': 'FILL_IN'}
+email_recipients = {'from': 'FILL_IN', 'to': 'FILL_IN'}
+
+
+host = 'FILL_IN'
+username = 'FILL_IN'
+password = 'FILL_IN'
+port = 'FILL_IN'
+cluster = 'FILL_IN'
+dc = 'FILL_IN'
+datastore = 'FILL_IN'
 
 
 class VsphereOps:
@@ -25,7 +28,7 @@ class VsphereOps:
     def __init__(self):
         cmd = 'git clone https://github.com/red-hat-storage/ocs-ci.git'
         check_output(cmd, shell=True).decode()
-        vsphere_mod = importlib.import_module(f"ocs_ci.utility.vsphere")
+        vsphere_mod = importlib.import_module(f"ocs-ci.ocs_ci.utility.vsphere")
         self.vsphere = vsphere_mod.VSPHERE(host=host, user=username, password=password)
 
     def remove_ocsci_dir(self):
@@ -101,8 +104,8 @@ class VsphereOps:
                     comments += f"This cluster is consuming a considerable amount of space"
                 table.add_row([rp.name, len(rp.vm), run_time, f"{storage_usage:.2f} TB", comments])
             utilization = (1 - free_space_per) * 100
-            sender = config.email_recipients['from']
-            to = config.email_recipients['to']
+            sender = email_recipients['from']
+            to = email_recipients['to']
             subject = f'CRITICAL - vSphere {dc} {datastore} utilization is at {utilization:.1f}%'
             table.sortby = "Run Time (in Hours)"
             table.reversesort = True
@@ -119,8 +122,8 @@ class VsphereOps:
                 f"Please destroy any cluster that is not in use.</b>"
                 f"<br><br>The following {len(rps)} OCS clusters are currently running on {dc}:<br><br>{table}"
             )
-            user = config.email_credentials['username']
-            pwd = config.email_credentials['password']
+            user = email_credentials['username']
+            pwd = email_credentials['password']
 
             self.mailer(sender=sender, to=to, subject=subject, text=text, user=user, pwd=pwd)
 
