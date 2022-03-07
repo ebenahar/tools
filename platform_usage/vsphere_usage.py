@@ -222,7 +222,7 @@ class VsphereOps(OpsBase):
             for vm_list in parent_rp_lists:
                 cluster_name = vm_list[0].name
                 cluster_name.split("-")
-                cluster_name_refined = '-'.join(cluster_name[:2])
+                cluster_name_refined = '-'.join(cluster_name.split("-")[:2])
                 add_cluster_to_table(cluster_name, cluster_name_refined, vm_list, IPI_HINT)
 
             resources['rps_num'] = len(rps) + len(parent_rp_lists)
