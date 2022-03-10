@@ -12,8 +12,13 @@ from subprocess import check_output
 import smtplib
 import datetime
 import importlib
+import argparse
 from subprocess import check_output
 from collections import defaultdict
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -39,7 +44,6 @@ BASE_VSPHERE_ENV_DICT = {
     "lockable_resources_num": None
 }
 
-DIVIDER_STR = "<br>" + "-" * 75 + "<br>"
 
 # Use BASE_VSPHERE_ENV_DICT and extend it with the relevant details
 VSPHERE_ENV_DICT_LIST = list()
@@ -55,6 +59,7 @@ EMAIL_SENDER_USERNAME = ""
 EMAIL_SENDER_PASSWORD = ""
 SMTP_DETAILS = None
 RECIPIENTS_LIST = ""
+TO_LIST = []
 
 MAIL_SUFFIX = None
 IGNORE_LIST = list()
@@ -62,24 +67,24 @@ IGNORE_LIST = list()
 sslContext = ssl._create_unverified_context()
 HEADER = '\033[95m'
 
+SHEET_NAME = ""
+
+
+def remove_ocsci_dir():
+    cmd = 'rm -rf ocs-ci'
+    check_output(cmd, shell=True).decode()
+
+
+def clone_ocsci():
+    cmd = 'git clone https://github.com/red-hat-storage/ocs-ci.git'
+    check_output(cmd, shell=True).decode()
+
 
 class OpsBase:
     """
     """
-    def __init__(self):
-        self.remove_ocsci_dir()
-        cmd = 'git clone https://github.com/red-hat-storage/ocs-ci.git'
-        check_output(cmd, shell=True).decode()
-
-    def remove_ocsci_dir(self):
-        cmd = 'rm -rf ocs-ci'
-        check_output(cmd, shell=True).decode()
-
     def get_resource_consumption_report(self):
         pass
-
-    def __del__(self):
-        self.remove_ocsci_dir()
 
     def get_cluster_name_prefix(self, parts, index=0):
         prefix = parts[index]
@@ -89,8 +94,6 @@ class OpsBase:
         pass
 
     def set_table(self, table):
-        table.sortby = "Run Time (in Hours)"
-        table.reversesort = True
         return table.get_html_string(
             attributes={
                 'border': 1,
@@ -117,23 +120,35 @@ class VsphereOps(OpsBase):
         self.cluster_name = env_dict["cluster_name"]
         self.datastore = env_dict["datastore"]
         vsphere_module = importlib.import_module(f"ocs-ci.ocs_ci.utility.vsphere")
-        self.vsphere_ops = vsphere_module.VSPHERE(host=self.host, user=self.username, password=self.password)
+        self.vsphere_utils = vsphere_module.VSPHERE(host=self.host, user=self.username, password=self.password)
         self.lockable_resources_num = env_dict["lockable_resources_num"]
 
     def get_datastore_free_capacity_percentage(self, datastore_name, datacenter_name):
-        ds_obj = self.vsphere_ops.find_datastore_by_name(datastore_name, datacenter_name)
+        ds_obj = self.vsphere_utils.find_datastore_by_name(datastore_name, datacenter_name)
         return ds_obj.summary.freeSpace / ds_obj.summary.capacity
+
+    def get_free_memory_percentage(self, cluster_name, datacenter_name):
+        cluster_obj = self.vsphere_utils.get_cluster(cluster_name, datacenter_name)
+        return cluster_obj.GetResourceUsage().memUsedMB / cluster_obj.GetResourceUsage().memCapacityMB
+
+    def get_free_cpu_percentage(self, cluster_name, datacenter_name):
+        cluster_obj = self.vsphere_utils.get_cluster(cluster_name, datacenter_name)
+        return cluster_obj.GetResourceUsage().cpuUsedMHz / cluster_obj.GetResourceUsage().cpuCapacityMHz
 
     def get_cluster_details(self, cluster_name, hint_type, vm_list):
         run_time = 0
         prefix = self.get_cluster_name_prefix(cluster_name.split("-"))
         storage_usage = 0
+        memory_usage = 0
+        cpu_usage = 0
         for vm in vm_list:
             if hint_type in vm.name:
                 run_time = self.get_run_time(vm)
             storage_usage += self.get_vm_storage_usage(vm)
+            memory_usage += self.get_vm_memory_usage(vm)
+            cpu_usage += self.get_vm_cpu_usage(vm)
         storage_usage = storage_usage / 1e+12
-        return run_time, storage_usage, prefix
+        return run_time, storage_usage, memory_usage, cpu_usage, prefix
 
     def get_run_time(self, vm):
         now = datetime.datetime.now()
@@ -147,6 +162,12 @@ class VsphereOps(OpsBase):
             vm_storage_usage += disk.unshared
         return vm_storage_usage
 
+    def get_vm_memory_usage(self, vm):
+        return vm.summary.quickStats.guestMemoryUsage / 1024
+
+    def get_vm_cpu_usage(self, vm):
+        return vm.summary.quickStats.overallCpuUsage / 1000
+
     def get_resource_consumption_report(self):
         """
         """
@@ -154,14 +175,14 @@ class VsphereOps(OpsBase):
             "vSphere Env",
             "Cluster Name",
             "Number Of VMs",
-            "Run Time (in Hours)",
-            "Usage On Datastore",
+            "Run Time",
+            "Memory Usage",
+            "CPU Usage",
+            "Storage Usage",
             "Comments"
         ]
-
         min_diff = 0.15
         resources_list = list()
-        to_list = list()
         for vsphere_env_dict in VSPHERE_ENV_DICT_LIST:
             self.set_env_details(vsphere_env_dict)
             resources = dict()
@@ -170,14 +191,31 @@ class VsphereOps(OpsBase):
             table.field_names = field_names
 
             free_space_per = self.get_datastore_free_capacity_percentage(datastore_name=self.datastore, datacenter_name=self.dc_name)
-            utilization = (1 - free_space_per) * 100
+            storage_utilization = (1 - free_space_per) * 100
             if free_space_per < min_diff:
                 print(
-                    f"There is not enough space on {resources['vsphere_env']} <i>{self.dc_name}</i>'s datastore <i>{self.datastore}</i>. Used space is {utilization:.1f}%"
+                    f"There is not enough space available on {resources['vsphere_env']} <i>{self.dc_name}</i>'s datastore <i>{self.datastore}</i>. Used space is {storage_utilization:.1f}%"
                 )
-            resources['utilization'] = f"{utilization:.1f}%"
 
-            cluster_obj = self.vsphere_ops.get_cluster(self.cluster_name, self.dc_name)
+            free_memory_per = self.get_free_memory_percentage(cluster_name=self.cluster_name, datacenter_name=self.dc_name)
+            memory_utilization = free_memory_per * 100
+            if free_memory_per < min_diff:
+                print(
+                    f"There is not enough memory available on {resources['vsphere_env']} <i>{self.dc_name}</i>'s cluster <i>{self.cluster_name}</i>. Used memory is {memory_utilization:.1f}%"
+                )
+
+            free_cpu_per = self.get_free_cpu_percentage(cluster_name=self.cluster_name, datacenter_name=self.dc_name)
+            cpu_utilization = free_cpu_per * 100
+            if free_cpu_per < min_diff:
+                print(
+                    f"There are not enough available CPUs on {resources['vsphere_env']} <i>{self.dc_name}</i>'s cluster <i>{self.cluster_name}</i>. Used CPU is {cpu_utilization:.1f}%"
+                )
+
+            resources['storage_utilization'] = f"{storage_utilization:.1f}%"
+            resources['memory_utilization'] = f"{memory_utilization:.1f}%"
+            resources['cpu_utilization'] = f"{cpu_utilization:.1f}%"
+
+            cluster_obj = self.vsphere_utils.get_cluster(self.cluster_name, self.dc_name)
 
             parent_rp = cluster_obj.resourcePool
             parent_rp_vms = [vm for vm in parent_rp.vm if not any(x in vm.name for x in IGNORE_LIST)]
@@ -186,26 +224,33 @@ class VsphereOps(OpsBase):
 
             def add_cluster_to_table(cluster_name, cluster_name_refined, vm_list, hint):
                 if 'jnk' not in cluster_name:
-                    run_time, storage_usage, prefix = self.get_cluster_details(cluster_name, hint, vm_list)
+                    run_time, storage_usage, memory_usage, cpu_usage, prefix = self.get_cluster_details(cluster_name, hint, vm_list)
                     recipient = None
                     comments = ""
                     if prefix is not None:
                         recipient = f"{prefix}{MAIL_SUFFIX}"
 
-                    if run_time > 72:
+                    if run_time > HIGH_RUN_TIME:
                         comments += f"{recipient} - This cluster is running for {int(run_time / 24)} days."
-                        if recipient not in to_list:
-                            to_list.append(recipient)
+                        if recipient not in TO_LIST:
+                            TO_LIST.append(recipient)
                     if comments:
                         comments += f"\n"
-                    if storage_usage > 3:
-                        if recipient not in to_list:
-                            to_list.append(recipient)
+                    if storage_usage > HIGH_STORAGE:
+                        if recipient not in TO_LIST:
+                            TO_LIST.append(recipient)
                         if not comments:
                             comments += f"{recipient} - "
-                        comments += f"This cluster is consuming a considerable amount of space"
+                        comments += f"This cluster is consuming a considerable amount of space."
+                    if memory_usage > HIGH_MEMORY:
+                        if recipient not in TO_LIST:
+                            TO_LIST.append(recipient)
+                        if not comments:
+                            comments += f"{recipient} - "
+                        comments += f"\nThis cluster is consuming a considerable amount of memory."
+
                     table.add_row(
-                        [self.host, cluster_name_refined, len(vm_list), f"{run_time}", f"{storage_usage:.2f} TB", comments]
+                        [self.host, cluster_name_refined, len(vm_list), f"{run_time} H", f"{memory_usage:.1f} GB", f"{cpu_usage:.1f} GHz", f"{storage_usage:.2f} TB", comments]
                     )
 
             for rp in rps:
@@ -222,7 +267,7 @@ class VsphereOps(OpsBase):
             for vm_list in parent_rp_lists:
                 cluster_name = vm_list[0].name
                 cluster_name.split("-")
-                cluster_name_refined = '-'.join(cluster_name[:2])
+                cluster_name_refined = '-'.join(cluster_name.split("-")[:2])
                 add_cluster_to_table(cluster_name, cluster_name_refined, vm_list, IPI_HINT)
 
             resources['rps_num'] = len(rps) + len(parent_rp_lists)
@@ -232,13 +277,15 @@ class VsphereOps(OpsBase):
             resources['table'] = refined_table
             resources_list.append(resources)
 
-        report = f"<br><b>vSphere Consumption Report</b><br>{DIVIDER_STR}<br>"
+        report = f"<br><b><u><h3>vSphere Consumption Report</h3><u></b>"
         for resources in resources_list:
             if resources['rps_num'] > 0:
                 report += (
                     f"<u>In {resources['vsphere_env']}, <i>{self.dc_name}</i>'s utilization details are:</u>"
-                    f"<br>Datastore <i>{self.datastore}</i> utilization: <b>{resources['utilization']}</b>"
-                    f"<br>Lockable Resources Utilization: <b>{resources['rps_num']} out of {resources['lockable_resources_num']}</b> available resources are currently in use"
+                    f"<br><b>Lockable Resources:</b> <b>{resources['rps_num']} out of {resources['lockable_resources_num']}</b> available resources are currently in use"
+                    f"<br><b>Storage:</b> Datastore <i>{self.datastore}</i> utilization is at <b>{resources['storage_utilization']}</b>"
+                    f"<br><b>Memory:</b> Overall Memory utilization is at <b>{resources['memory_utilization']}</b></br>"
+                    f"<br><b>CPU:</b> Overall CPU utilization is at <b>{resources['cpu_utilization']}</b></br>"
                     f"<br><br>"
                     f"The following <b>{resources['rps_num']}</b> ODF/OCP/ACM clusters are currently running on <i>{self.dc_name}</i>"
                     f"<br><br>{resources['table']}<br><br>"
@@ -287,11 +334,9 @@ class AWSOps(OpsBase):
             "Cluster Name",
             "Number Of EC2 Instances",
             "EC2 Instance Types",
-            "Run Time (in Hours)",
+            "Run Time",
             "Comments"
         ]
-
-        to_list = list()
 
         def add_cluster_to_table(cluster_name, cluster_running_time, num_of_instances, instance_types):
             if 'vault' in cluster_name:
@@ -302,17 +347,18 @@ class AWSOps(OpsBase):
 
             recipient = None
 
-            if prefix is not None and 'jnk' not in prefix:
+            if prefix is not None and not any(x in prefix for x in ['jnk', 'j-']):
                 recipient = f"{prefix}{MAIL_SUFFIX}"
 
             comments = ""
             if cluster_running_time > 72:
                 comments += f"{recipient} - This cluster is running for {int(cluster_running_time / 24)} days."
-                if recipient and recipient not in to_list:
-                    to_list.append(recipient)
-            table.add_row([self.region_name, cluster_name, num_of_instances, instance_types, f"{cluster_running_time}", comments])
+                if recipient and recipient not in TO_LIST:
+                    TO_LIST.append(recipient)
+            table.add_row([self.region_name, cluster_name, num_of_instances, instance_types, f"{cluster_running_time} H", comments])
 
         number_of_clusters = 0
+        vmless_clusters = list()
 
         cloudformation_vpc_names = list()
         vpcs = self.aws_ops.ec2_client.describe_vpcs()["Vpcs"]
@@ -332,8 +378,11 @@ class AWSOps(OpsBase):
                 ec2_instances = vpc_obj.instances.all()
 
                 cluster_running_time, num_of_instances, instance_types = self.get_cluster_details(ec2_instances)
-                add_cluster_to_table(cluster_name, cluster_running_time, num_of_instances, instance_types)
-                number_of_clusters += 1
+                if num_of_instances > 0:
+                    add_cluster_to_table(cluster_name, cluster_running_time, num_of_instances, instance_types)
+                    number_of_clusters += 1
+                else:
+                    vmless_clusters.append(cluster_name)
 
         # Get all cloudformation based clusters to delete
         for vpc_name in cloudformation_vpc_names:
@@ -341,7 +390,7 @@ class AWSOps(OpsBase):
                 f"{vpc_name.replace('-vpc', '')}*"
             )
             ec2_instances = [
-                aws.get_ec2_instance(instance_dict["id"])
+                self.aws_ops.get_ec2_instance(instance_dict["id"])
                 for instance_dict in instance_dicts
             ]
             if not ec2_instances:
@@ -364,13 +413,17 @@ class AWSOps(OpsBase):
             number_of_clusters += 1
 
         refined_table = self.set_table(table)
-        report = "<br><b>AWS Consumption Report</b><br>"
+        report = "<br><b><u><h3>AWS Consumption Report</h3></u></b>"
         if number_of_clusters > 0:
             report += (
-                f"{DIVIDER_STR}<br>"
-                f"<u>The following <b>{number_of_clusters}</b> ODF/OCP/ACM clusters exist in AWS (region {self.region_name})</u>"
+                f"<u>The following <b>{number_of_clusters}</b> ODF/OCP/ACM clusters are currently running</u>"
                 f"<br><br>{refined_table}<br><br>"
             )
+            if len(vmless_clusters) > 0:
+                vmless_clusters = '\n'.join(vmless_clusters)
+                report += (
+                    f"In addition, the following leftover VM-less VPCs and their associated resources still exist:\n{vmless_clusters}"
+                )
         return report
 
 
@@ -392,14 +445,63 @@ def get_resource_consumption_reports():
     return final_report
 
 
-def send_email():
-    """
+def get_dc_utilization_data():
 
+    g_sheet_module = importlib.import_module(f"ocs-ci.ocs_ci.utility.spreadsheet.spreadsheet_api")
+
+    indices = range(len(VSPHERE_ENV_DICT_LIST))
+
+    def set_data(vsphere_env_dict, index):
+        vsphere_ops = VsphereOps()
+        vsphere_ops.set_env_details(vsphere_env_dict)
+        g_sheet = g_sheet_module.GoogleSpreadSheetAPI(sheet_name=SHEET_NAME, sheet_index=index)
+        print(g_sheet.sheet)
+
+        while True:
+
+            now = datetime.datetime.now()
+            date = now.strftime("%m/%d/%y")
+            current_time = now.strftime("%H:%M")
+
+            cluster_obj = vsphere_ops.vsphere_utils.get_cluster(vsphere_ops.cluster_name, vsphere_ops.dc_name)
+            parent_rp = cluster_obj.resourcePool
+            parent_rp_vms = [vm for vm in parent_rp.vm if not any(x in vm.name for x in IGNORE_LIST)]
+            rps = cluster_obj.resourcePool.resourcePool
+            vm_dict = defaultdict(list)
+            for vm in parent_rp_vms:
+                vm_dict[vm.name.split('-')[0]].append(vm)
+            parent_rp_lists = vm_dict.values()
+
+            num_of_clusters = len(rps) + len(parent_rp_lists)
+
+            free_space_per = (vsphere_ops.get_datastore_free_capacity_percentage(datastore_name=vsphere_ops.datastore, datacenter_name=vsphere_ops.dc_name))
+            storage_utilization = 1 - free_space_per
+
+            free_memory_per = vsphere_ops.get_free_memory_percentage(cluster_name=vsphere_ops.cluster_name, datacenter_name=vsphere_ops.dc_name)
+            memory_utilization = free_memory_per
+
+            free_cpu_per = vsphere_ops.get_free_cpu_percentage(cluster_name=vsphere_ops.cluster_name, datacenter_name=vsphere_ops.dc_name)
+            cpu_utilization = free_cpu_per
+
+            values = [date, current_time, num_of_clusters, storage_utilization, memory_utilization, cpu_utilization]
+
+            print(f"Time is: {current_time}. Updating sheet: {g_sheet.sheet}")
+            g_sheet.insert_row(values, 2)
+
+    thread_list = list()
+    for vsphere_env_dict, index in zip(VSPHERE_ENV_DICT_LIST, indices):
+        thread_list.append(threading.Thread(target=set_data, args=(vsphere_env_dict, index,)))
+    for thread in thread_list:
+        thread.start()
+    for thread in thread_list:
+        thread.join()
+
+
+def utilization_report_to_email():
     """
-    sender = EMAIL_SENDER_USERNAME
-    to = RECIPIENTS_LIST
+    """
     subject = f'ODF QE On-Prem and Cloud Resource Consumption Report'
-
+    sender = EMAIL_SENDER_USERNAME
     text = (
         f"Hello,<br><br>Below is a report about ODF QE's On-Prem and Cloud resource consumption."
         f"<br><br><b>Please destroy any cluster that is not in use.</b><br><br>"
@@ -407,12 +509,8 @@ def send_email():
 
     text = text + get_resource_consumption_reports()
 
-    user = EMAIL_SENDER_USERNAME
-    pwd = EMAIL_SENDER_PASSWORD
-
     msg = MIMEMultipart('alternative')
-    msg['From'] = sender
-    msg['To'] = to
+    to = TO_LIST
     msg['Subject'] = subject
 
     # msg_p1 = MIMEText(text, 'plain', 'UTF-8')
@@ -421,13 +519,40 @@ def send_email():
     # msg.attach(msg_p1)
     msg.attach(msg_p2)
 
-    server = SMTP_DETAILS
+    server = smtplib.SMTP("smtp.gmail.com", 587)
     server.ehlo()
     server.starttls()
-    server.login(user, pwd)
-    server.sendmail(msg['From'], to, msg.as_string())
+    server.login(EMAIL_SENDER_USERNAME, EMAIL_SENDER_PASSWORD)
+    server.sendmail(sender, to, msg.as_string())
     server.close()
 
 
-if __name__ == "__main__":
-    send_email()
+def resource_usage_reporter():
+    parser = argparse.ArgumentParser(
+        description="Resource Usage Reporter",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--sheet",
+        required=False,
+        help="The mode of report to append utilization values in Google Spreadsheet",
+    )
+    parser.add_argument(
+        "--email",
+        action="store",
+        required=False,
+        help="The mode of report to send an email",
+    )
+
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    remove_ocsci_dir()
+    clone_ocsci()
+    args = resource_usage_reporter()
+    if args.sheet:
+        get_dc_utilization_data()
+    if args.email:
+        utilization_report_to_email()
+    remove_ocsci_dir()
