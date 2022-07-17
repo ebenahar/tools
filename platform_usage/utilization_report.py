@@ -510,7 +510,7 @@ def get_resource_consumption_reports():
     """
     """
     final_report = ""
-    for platform in [AWSOps, VsphereOps]:
+    for platform in [AWSOps, AzureOps, VsphereOps]:
         platform_obj = platform()
         final_report += platform_obj.get_resource_consumption_report()
 
