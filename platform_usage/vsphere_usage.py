@@ -33,41 +33,48 @@ from pyVim import connect
 from pyVmomi import vim
 from pyVim.connect import Disconnect, SmartStubAdapter, VimSessionOrientedStub
 
+
+# vSphere details
 BASE_VSPHERE_ENV_DICT = {
     "host": "",
     "username": "",
     "password": "",
     "port": 443,
-    "cluster_name": "",
-    "dc_name": "",
-    "datastore": "",
+    "cluster_name": '',
+    "dc_name": '',
+    "datastore": '',
     "lockable_resources_num": None
 }
 
-
-# Use BASE_VSPHERE_ENV_DICT and extend it with the relevant details
-VSPHERE_ENV_DICT_LIST = list()
-
 IPI_HINT = 'master-'
 UPI_HINT = 'lb-'
+
+HIGH_RUN_TIME = 120
+HIGH_STORAGE = 3
+HIGH_MEMORY = 35
 
 # AWS details
 AWS_CLOUDFORMATION_TAG = None
 ENV_DICT = {"region_name": ""}
 
-EMAIL_SENDER_USERNAME = ""
-EMAIL_SENDER_PASSWORD = ""
-SMTP_DETAILS = None
-RECIPIENTS_LIST = ""
-TO_LIST = []
+# Azure details
 
-MAIL_SUFFIX = None
-IGNORE_LIST = list()
+# Other
+DIVIDER_STR = "-" * 75
+
+# Email details
+EMAIL_SENDER_USERNAME = ''
+EMAIL_SENDER_PASSWORD = ''
+TO_LIST = []
+SMTP_DETAILS = smtplib.SMTP("smtp.gmail.com", 587)
+
+IGNORE_LIST = ["rhcos", "rhel", "vCLS"]
+MAIL_SUFFIX = ""
 
 sslContext = ssl._create_unverified_context()
 HEADER = '\033[95m'
 
-SHEET_NAME = ""
+SHEET_NAME = "DCs Utilization"
 
 
 def remove_ocsci_dir():
@@ -163,7 +170,7 @@ class VsphereOps(OpsBase):
         return vm_storage_usage
 
     def get_vm_memory_usage(self, vm):
-        return vm.summary.quickStats.guestMemoryUsage / 1024
+        return vm.summary.quickStats.hostMemoryUsage / 1024
 
     def get_vm_cpu_usage(self, vm):
         return vm.summary.quickStats.overallCpuUsage / 1000
@@ -171,9 +178,11 @@ class VsphereOps(OpsBase):
     def get_resource_consumption_report(self):
         """
         """
+        report = f"<br><b><u><h3>vSphere Consumption Report</h3><u></b>"
         field_names = [
             "vSphere Env",
             "Cluster Name",
+            "Deployment Type",
             "Number Of VMs",
             "Run Time",
             "Memory Usage",
@@ -249,8 +258,10 @@ class VsphereOps(OpsBase):
                             comments += f"{recipient} - "
                         comments += f"\nThis cluster is consuming a considerable amount of memory."
 
+                    deployment_type = "IPI" if hint == IPI_HINT else "UPI"
+
                     table.add_row(
-                        [self.host, cluster_name_refined, len(vm_list), f"{run_time} H", f"{memory_usage:.1f} GB", f"{cpu_usage:.1f} GHz", f"{storage_usage:.2f} TB", comments]
+                        [self.host, cluster_name_refined, deployment_type, len(vm_list), f"{run_time} H", f"{memory_usage:.1f} GB", f"{cpu_usage:.1f} GHz", f"{storage_usage:.2f} TB", comments]
                     )
 
             for rp in rps:
@@ -277,8 +288,6 @@ class VsphereOps(OpsBase):
             resources['table'] = refined_table
             resources_list.append(resources)
 
-        report = f"<br><b><u><h3>vSphere Consumption Report</h3><u></b>"
-        for resources in resources_list:
             if resources['rps_num'] > 0:
                 report += (
                     f"<u>In {resources['vsphere_env']}, <i>{self.dc_name}</i>'s utilization details are:</u>"
@@ -427,18 +436,81 @@ class AWSOps(OpsBase):
         return report
 
 
+AZURE_DICT1 = {}
+AZURE_DICT2 = {}
+AZURE_DICT_LIST = AZURE_DICT1 + AZURE_DICT2
+
+
 class AzureOps(OpsBase):
     """
     """
     def __init__(self):
         super(AzureOps, self).__init__()
 
+    def set_env_details(self, env_dict):
+        """
+        """
+        azure_module = importlib.import_module(f"ocs-ci.ocs_ci.utility.azure_utils")
+        self.azure_utils = azure_module.AZURE(
+            subscription_id=env_dict["subscription_id"],
+            tenant_id=env_dict['tenant_id'],
+            client_id=env_dict['client_id'],
+            client_secret=env_dict['client_secret'],
+            cluster_resource_group=env_dict['cluster_resource_group']
+        )
+
+    def get_resource_consumption_report(self):
+        """
+        """
+        table = PrettyTable()
+        table.field_names = [
+            "Cluster Name",
+            "Number Of Instances",
+            "Instances Types",
+            "Creation Time (UTC)",
+            "Azure Account",
+        ]
+        number_of_clusters = 0
+        for azure_dict in AZURE_DICT_LIST:
+            self.set_env_details(azure_dict)
+            group_list = self.azure_utils.resource_client.resource_groups.list()
+            group_list = [rg for rg in group_list if rg.name.endswith("-rg")]
+            number_of_clusters += len(group_list)
+            for rg in group_list:
+                self.azure_utils._cluster_resource_group = rg.name
+                vm_list = self.azure_utils.compute_client.virtual_machines.list(rg.name)
+                num_of_vms = 0
+                vm_types = list()
+                launch_time = 0
+                for vm in vm_list:
+                    num_of_vms += 1
+                    vm = self.azure_utils.compute_client.virtual_machines.get(rg.name, vm.name, expand="instanceView")
+                    if IPI_HINT in vm.name and self.azure_utils.get_vm_power_status(vm.name) == 'running':
+                        launch_time = vm.instance_view.statuses[0].as_dict()['time'].split('T')
+                        launch_time[1] = launch_time[1].split('.')[0]
+                        launch_time = " ".join(launch_time)
+
+                    vm_type = vm.hardware_profile.vm_size
+                    if vm_type not in vm_types:
+                        vm_types.append(vm_type)
+
+                table.add_row([rg.name.replace("-rg", ""), num_of_vms, ', '.join(vm_types), launch_time, azure_dict['account']])
+
+        refined_table = self.set_table(table)
+        report = "<br><b><u><h3>Azure Consumption Report</h3></u></b>"
+        if number_of_clusters > 0:
+            report += (
+                f"<u>The following <b>{number_of_clusters}</b> ODF/OCP/ACM clusters are currently running</u>"
+                f"<br><br>{refined_table}<br><br>"
+            )
+        return report
+
 
 def get_resource_consumption_reports():
     """
     """
     final_report = ""
-    for platform in [VsphereOps, AWSOps]:
+    for platform in [AWSOps, VsphereOps]:
         platform_obj = platform()
         final_report += platform_obj.get_resource_consumption_report()
 
@@ -500,8 +572,9 @@ def get_dc_utilization_data():
 def utilization_report_to_email():
     """
     """
+    sender = ''
     subject = f'ODF QE On-Prem and Cloud Resource Consumption Report'
-    sender = EMAIL_SENDER_USERNAME
+
     text = (
         f"Hello,<br><br>Below is a report about ODF QE's On-Prem and Cloud resource consumption."
         f"<br><br><b>Please destroy any cluster that is not in use.</b><br><br>"
@@ -510,7 +583,7 @@ def utilization_report_to_email():
     text = text + get_resource_consumption_reports()
 
     msg = MIMEMultipart('alternative')
-    to = TO_LIST
+    to = ", ".join(TO_LIST)
     msg['Subject'] = subject
 
     # msg_p1 = MIMEText(text, 'plain', 'UTF-8')
